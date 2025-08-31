@@ -315,24 +315,45 @@ async def listen_for_audio(audio_queue):
                 exception_on_overflow=False,
             )
             
-            # Simple voice activity detection
-            audio_data = np.frombuffer(data, dtype=np.int16)
-            volume = np.sqrt(np.mean(audio_data**2))
-            
-            if volume > silence_threshold:
-                if not speech_detected:
-                    speech_detected = True
-                    # Interrupt AI if it's speaking
-                    if audio_manager.is_playing:
-                        audio_manager.interrupt()
-                        print("🤫 User started speaking - interrupting AI")
+            # Convert audio data to numpy array with proper error handling
+            try:
+                audio_data = np.frombuffer(data, dtype=np.int16)
                 
-                await audio_queue.put(data)
-            else:
-                if speech_detected:
-                    speech_detected = False
-                    # Reset interrupt state when user stops speaking
-                    audio_manager.reset_interrupt()
+                # Ensure we have valid audio data
+                if len(audio_data) == 0:
+                    continue
+                
+                # Convert to float to avoid overflow issues
+                audio_float = audio_data.astype(np.float32)
+                
+                # Calculate RMS volume with safeguards
+                mean_square = np.mean(audio_float**2)
+                
+                # Handle edge cases for volume calculation
+                if np.isnan(mean_square) or mean_square < 0:
+                    volume = 0
+                else:
+                    volume = np.sqrt(mean_square)
+                
+                # Check for speech
+                if volume > silence_threshold:
+                    if not speech_detected:
+                        speech_detected = True
+                        # Interrupt AI if it's speaking
+                        if audio_manager.is_playing:
+                            audio_manager.interrupt()
+                            print("🤫 User started speaking - interrupting AI")
+                    
+                    await audio_queue.put(data)
+                else:
+                    if speech_detected:
+                        speech_detected = False
+                        # Reset interrupt state when user stops speaking
+                        audio_manager.reset_interrupt()
+                        
+            except (ValueError, TypeError) as e:
+                print(f"⚠️ Audio processing warning: {e}")
+                continue
                     
         except Exception as e:
             print(f"❌ Error in audio listening: {e}")
