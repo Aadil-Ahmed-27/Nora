@@ -12,7 +12,6 @@ import numpy as np
 import pyaudio
 import cv2
 import PIL.Image
-import mss
 import gradio as gr
 
 from google import genai
@@ -26,10 +25,6 @@ from google.genai.types import (
 
 from dotenv import load_dotenv
 
-# Uncomment these if you have the recipe agent modules
-# from Nora.agents.recipe_agent import RecipeAgent
-# from Nora.session_managers.base_session_manager import SessionManager
-
 load_dotenv()
 
 # Audio Configuration
@@ -39,18 +34,11 @@ AUDIO_RECEIVE_SAMPLE_RATE = 24000
 AUDIO_SEND_SAMPLE_RATE = 16000
 AUDIO_CHUNK_SIZE = 512
 
-# Video Configuration
-VIDEO_FRAME_RATE_DELAY = 1.0
-
 # Global Variables
 CLIENT_INSTANCE = None
 DEFAULT_MODEL = "gemini-2.5-flash-live-preview"
 
-# Uncomment if you have the recipe agent
-# recipe_agent = RecipeAgent(model_name="gemini-2.0-flash")
-# recipe_session_manager = SessionManager(agent=recipe_agent.recipe_agent)
-
-# For now, we'll create a simple recipe tool placeholder
+# Recipe tool placeholder
 def get_recipe(query: str) -> str:
     """Placeholder recipe function"""
     return f"Here's a simple recipe for {query}: Mix ingredients, cook, and enjoy!"
@@ -219,365 +207,353 @@ class AudioManager:
         if self.pya is not None:
             self.pya.terminate()
 
-class ConversationManager:
-    def __init__(self):
-        self.audio_manager = None
-        self.session = None
-        self.client = None
-        self.is_running = False
-        self.conversation_task = None
-        self.video_mode = "none"
-        self.cap = None
-        self.sct = None
-        self.monitor = None
+# Global state
+conversation_active = False
+audio_manager = None
+session = None
+client = None
+cap = None
+
+async def get_camera_frame():
+    """Get frame from camera"""
+    global cap
+    if cap is None:
+        return None
         
-    async def initialize(self, video_mode="none"):
-        """Initialize the conversation manager"""
-        try:
-            # Initialize Gemini client
-            self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-            print("✅ Gemini client initialized")
+    ret, frame = await asyncio.to_thread(cap.read)
+    if not ret:
+        return None
+        
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img = PIL.Image.fromarray(frame_rgb)
+    img.thumbnail([512, 512])
+    
+    image_io = io.BytesIO()
+    img.save(image_io, format="jpeg", quality=70)
+    image_io.seek(0)
+    image_bytes = image_io.read()
+    
+    return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
+
+async def conversation_loop():
+    """Main conversation loop"""
+    global conversation_active, audio_manager, session, client, cap
+    
+    try:
+        # Initialize Gemini client
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        print("✅ Gemini client initialized")
+        
+        # Initialize audio manager
+        audio_manager = AudioManager(
+            input_sample_rate=AUDIO_SEND_SAMPLE_RATE,
+            output_sample_rate=AUDIO_RECEIVE_SAMPLE_RATE
+        )
+        await audio_manager.initialize()
+        
+        # Initialize camera
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("⚠️ Could not open camera")
+            cap = None
+        else:
+            print("✅ Camera initialized")
+        
+        # Start conversation
+        async with client.aio.live.connect(
+            model=DEFAULT_MODEL, 
+            config=LIVE_CONNECT_CONFIG
+        ) as session:
+            print("🚀 Conversation started!")
             
-            # Initialize audio manager
-            self.audio_manager = AudioManager(
-                input_sample_rate=AUDIO_SEND_SAMPLE_RATE,
-                output_sample_rate=AUDIO_RECEIVE_SAMPLE_RATE
+            # Create task queues
+            audio_send_queue = asyncio.Queue(maxsize=100)
+            video_send_queue = asyncio.Queue(maxsize=10)
+            
+            # Start all tasks
+            async with asyncio.TaskGroup() as tg:
+                # Audio input task
+                tg.create_task(listen_for_audio(audio_send_queue))
+                
+                # Video input task
+                if cap is not None:
+                    tg.create_task(capture_video(video_send_queue))
+                
+                # Send audio task
+                tg.create_task(send_audio(session, audio_send_queue))
+                
+                # Send video task
+                if cap is not None:
+                    tg.create_task(send_video(session, video_send_queue))
+                
+                # Receive responses task
+                tg.create_task(receive_responses(session))
+                
+                # Wait while conversation is active
+                while conversation_active:
+                    await asyncio.sleep(0.1)
+                    
+    except Exception as e:
+        print(f"❌ Error in conversation: {e}")
+        traceback.print_exc()
+    finally:
+        print("🛑 Conversation stopped")
+
+async def listen_for_audio(audio_queue):
+    """Listen for audio input and detect speech"""
+    global conversation_active, audio_manager
+    
+    print("🎤 Listening for audio...")
+    silence_threshold = 500
+    speech_detected = False
+    
+    while conversation_active:
+        try:
+            data = await asyncio.to_thread(
+                audio_manager.input_stream.read,
+                AUDIO_CHUNK_SIZE,
+                exception_on_overflow=False,
             )
-            await self.audio_manager.initialize()
             
-            # Initialize video if needed
-            self.video_mode = video_mode
-            if video_mode == "camera":
-                self.cap = cv2.VideoCapture(0)
-                if not self.cap.isOpened():
-                    print("⚠️ Could not open camera")
-                    self.video_mode = "none"
-                else:
-                    print("✅ Camera initialized")
-            elif video_mode == "screen":
-                self.sct = mss.mss()
-                self.monitor = self.sct.monitors[1]
-                print("✅ Screen capture initialized")
+            # Simple voice activity detection
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            volume = np.sqrt(np.mean(audio_data**2))
             
-            return True
-        except Exception as e:
-            print(f"❌ Error initializing conversation manager: {e}")
-            return False
-
-    async def start_conversation(self):
-        """Start the conversation loop"""
-        if self.is_running:
-            return
-            
-        self.is_running = True
-        try:
-            async with self.client.aio.live.connect(
-                model=DEFAULT_MODEL, 
-                config=LIVE_CONNECT_CONFIG
-            ) as session:
-                self.session = session
-                print("🚀 Conversation started!")
+            if volume > silence_threshold:
+                if not speech_detected:
+                    speech_detected = True
+                    # Interrupt AI if it's speaking
+                    if audio_manager.is_playing:
+                        audio_manager.interrupt()
+                        print("🤫 User started speaking - interrupting AI")
                 
-                # Create task queues
-                audio_send_queue = asyncio.Queue(maxsize=100)
-                video_send_queue = asyncio.Queue(maxsize=10)
-                stop_event = asyncio.Event()
-                
-                # Start all tasks
-                async with asyncio.TaskGroup() as tg:
-                    # Audio input task
-                    tg.create_task(self._listen_for_audio(audio_send_queue, stop_event))
-                    
-                    # Video input task (if enabled)
-                    if self.video_mode != "none":
-                        tg.create_task(self._capture_video(video_send_queue, stop_event))
-                    
-                    # Send audio task
-                    tg.create_task(self._send_audio(session, audio_send_queue, stop_event))
-                    
-                    # Send video task (if enabled)
-                    if self.video_mode != "none":
-                        tg.create_task(self._send_video(session, video_send_queue, stop_event))
-                    
-                    # Receive responses task
-                    tg.create_task(self._receive_responses(session, stop_event))
-                    
-                    # Wait for stop signal
-                    await stop_event.wait()
-                    
-        except Exception as e:
-            print(f"❌ Error in conversation: {e}")
-            traceback.print_exc()
-        finally:
-            self.is_running = False
-            print("🛑 Conversation stopped")
-
-    async def stop_conversation(self):
-        """Stop the conversation"""
-        self.is_running = False
-        if self.audio_manager:
-            self.audio_manager.interrupt()
-
-    async def _listen_for_audio(self, audio_queue, stop_event):
-        """Listen for audio input and detect speech"""
-        print("🎤 Listening for audio...")
-        silence_threshold = 500  # Adjust based on your microphone
-        speech_detected = False
-        
-        while not stop_event.is_set() and self.is_running:
-            try:
-                data = await asyncio.to_thread(
-                    self.audio_manager.input_stream.read,
-                    AUDIO_CHUNK_SIZE,
-                    exception_on_overflow=False,
-                )
-                
-                # Simple voice activity detection
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                volume = np.sqrt(np.mean(audio_data**2))
-                
-                if volume > silence_threshold:
-                    if not speech_detected:
-                        speech_detected = True
-                        # Interrupt AI if it's speaking
-                        if self.audio_manager.is_playing:
-                            self.audio_manager.interrupt()
-                            print("🤫 User started speaking - interrupting AI")
-                    
-                    await audio_queue.put(data)
-                else:
-                    if speech_detected:
-                        speech_detected = False
-                        # Reset interrupt state when user stops speaking
-                        self.audio_manager.reset_interrupt()
-                        
-            except Exception as e:
-                print(f"❌ Error in audio listening: {e}")
-                break
-
-    async def _capture_video(self, video_queue, stop_event):
-        """Capture video frames"""
-        print(f"📹 Starting video capture ({self.video_mode})")
-        
-        while not stop_event.is_set() and self.is_running:
-            try:
-                frame_data = None
-                
-                if self.video_mode == "camera" and self.cap:
-                    frame_data = await self._get_camera_frame()
-                elif self.video_mode == "screen" and self.sct:
-                    frame_data = await self._get_screen_frame()
-                
-                if frame_data:
-                    await video_queue.put(frame_data)
-                
-                await asyncio.sleep(VIDEO_FRAME_RATE_DELAY)
-                
-            except Exception as e:
-                print(f"❌ Error capturing video: {e}")
-                break
-
-    async def _get_camera_frame(self):
-        """Get frame from camera"""
-        ret, frame = await asyncio.to_thread(self.cap.read)
-        if not ret:
-            return None
-            
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = PIL.Image.fromarray(frame_rgb)
-        img.thumbnail([512, 512])
-        
-        image_io = io.BytesIO()
-        img.save(image_io, format="jpeg", quality=70)
-        image_io.seek(0)
-        image_bytes = image_io.read()
-        
-        return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
-
-    async def _get_screen_frame(self):
-        """Get screen capture frame"""
-        try:
-            sct_img = await asyncio.to_thread(self.sct.grab, self.monitor)
-            if not sct_img:
-                return None
-                
-            img = PIL.Image.frombytes("RGB", (sct_img.width, sct_img.height), sct_img.rgb)
-            img.thumbnail([768, 768])
-            
-            image_io = io.BytesIO()
-            img.save(image_io, format="jpeg", quality=70)
-            image_io.seek(0)
-            image_bytes = image_io.read()
-            
-            return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
-        except Exception as e:
-            print(f"❌ Error capturing screen: {e}")
-            return None
-
-    async def _send_audio(self, session, audio_queue, stop_event):
-        """Send audio data to Gemini"""
-        while not stop_event.is_set() and self.is_running:
-            try:
-                audio_data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
-                await session.send({"data": audio_data, "mime_type": "audio/pcm"})
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                print(f"❌ Error sending audio: {e}")
-                break
-
-    async def _send_video(self, session, video_queue, stop_event):
-        """Send video data to Gemini"""
-        while not stop_event.is_set() and self.is_running:
-            try:
-                video_data = await asyncio.wait_for(video_queue.get(), timeout=1.0)
-                await session.send(video_data)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                print(f"❌ Error sending video: {e}")
-                break
-
-    async def _receive_responses(self, session, stop_event):
-        """Receive and handle responses from Gemini"""
-        while not stop_event.is_set() and self.is_running:
-            try:
-                async for response in session.receive():
-                    if response.data:
-                        self.audio_manager.add_audio(response.data)
-                    elif response.tool_call:
-                        # Handle tool calls
-                        tool_call = response.tool_call
-                        if tool_call.function_calls:
-                            for func_call in tool_call.function_calls:
-                                if func_call.name == "get_recipe":
-                                    query = func_call.args.get("query", "")
-                                    result = get_recipe(query)
-                                    await session.send({
-                                        "tool_response": {
-                                            "function_responses": [{
-                                                "name": "get_recipe",
-                                                "response": {"result": result}
-                                            }]
-                                        }
-                                    })
-            except Exception as e:
-                print(f"❌ Error receiving responses: {e}")
-                break
-
-    def cleanup(self):
-        """Clean up resources"""
-        if self.audio_manager:
-            self.audio_manager.close_streams()
-        if self.cap:
-            self.cap.release()
-        if self.sct:
-            self.sct.close()
-
-# Global conversation manager
-conversation_manager = ConversationManager()
-
-def create_gradio_interface():
-    """Create the Gradio interface"""
-    
-    async def start_conversation_wrapper(video_mode):
-        """Wrapper to start conversation"""
-        try:
-            success = await conversation_manager.initialize(video_mode)
-            if success:
-                # Start conversation in background
-                asyncio.create_task(conversation_manager.start_conversation())
-                return "🚀 Conversation started! You can now talk to Nora.", gr.update(interactive=False), gr.update(interactive=True)
+                await audio_queue.put(data)
             else:
-                return "❌ Failed to initialize conversation", gr.update(interactive=True), gr.update(interactive=False)
+                if speech_detected:
+                    speech_detected = False
+                    # Reset interrupt state when user stops speaking
+                    audio_manager.reset_interrupt()
+                    
         except Exception as e:
-            return f"❌ Error: {e}", gr.update(interactive=True), gr.update(interactive=False)
-    
-    def start_conversation_sync(video_mode):
-        """Synchronous wrapper for Gradio"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(start_conversation_wrapper(video_mode))
-        finally:
-            loop.close()
-    
-    async def stop_conversation_wrapper():
-        """Wrapper to stop conversation"""
-        await conversation_manager.stop_conversation()
-        conversation_manager.cleanup()
-        return "🛑 Conversation stopped", gr.update(interactive=True), gr.update(interactive=False)
-    
-    def stop_conversation_sync():
-        """Synchronous wrapper for Gradio"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(stop_conversation_wrapper())
-        finally:
-            loop.close()
+            print(f"❌ Error in audio listening: {e}")
+            break
 
-    # Create the interface
+async def capture_video(video_queue):
+    """Capture video frames"""
+    global conversation_active
+    
+    print("📹 Starting video capture")
+    
+    while conversation_active:
+        try:
+            frame_data = await get_camera_frame()
+            if frame_data:
+                await video_queue.put(frame_data)
+            
+            await asyncio.sleep(1.0)  # 1 FPS
+            
+        except Exception as e:
+            print(f"❌ Error capturing video: {e}")
+            break
+
+async def send_audio(session, audio_queue):
+    """Send audio data to Gemini"""
+    global conversation_active
+    
+    while conversation_active:
+        try:
+            audio_data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+            await session.send({"data": audio_data, "mime_type": "audio/pcm"})
+        except asyncio.TimeoutError:
+            continue
+        except Exception as e:
+            print(f"❌ Error sending audio: {e}")
+            break
+
+async def send_video(session, video_queue):
+    """Send video data to Gemini"""
+    global conversation_active
+    
+    while conversation_active:
+        try:
+            video_data = await asyncio.wait_for(video_queue.get(), timeout=1.0)
+            await session.send(video_data)
+        except asyncio.TimeoutError:
+            continue
+        except Exception as e:
+            print(f"❌ Error sending video: {e}")
+            break
+
+async def receive_responses(session):
+    """Receive and handle responses from Gemini"""
+    global conversation_active, audio_manager
+    
+    while conversation_active:
+        try:
+            async for response in session.receive():
+                if response.data:
+                    audio_manager.add_audio(response.data)
+                elif response.tool_call:
+                    # Handle tool calls
+                    tool_call = response.tool_call
+                    if tool_call.function_calls:
+                        for func_call in tool_call.function_calls:
+                            if func_call.name == "get_recipe":
+                                query = func_call.args.get("query", "")
+                                result = get_recipe(query)
+                                await session.send({
+                                    "tool_response": {
+                                        "function_responses": [{
+                                            "name": "get_recipe",
+                                            "response": {"result": result}
+                                        }]
+                                    }
+                                })
+        except Exception as e:
+            print(f"❌ Error receiving responses: {e}")
+            break
+
+def start_conversation():
+    """Start the conversation"""
+    global conversation_active
+    
+    if conversation_active:
+        return "Already running", gr.update(interactive=False), gr.update(interactive=True)
+    
+    conversation_active = True
+    
+    # Start conversation in a separate thread
+    def run_conversation():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(conversation_loop())
+        finally:
+            loop.close()
+    
+    thread = threading.Thread(target=run_conversation, daemon=True)
+    thread.start()
+    
+    return "🚀 Conversation started! Talk to Nora!", gr.update(interactive=False), gr.update(interactive=True)
+
+def stop_conversation():
+    """Stop the conversation"""
+    global conversation_active, audio_manager, cap
+    
+    conversation_active = False
+    
+    if audio_manager:
+        audio_manager.interrupt()
+        audio_manager.close_streams()
+    
+    if cap:
+        cap.release()
+    
+    return "🛑 Conversation stopped", gr.update(interactive=True), gr.update(interactive=False)
+
+def get_camera_feed():
+    """Get camera feed for display"""
+    global cap
+    
+    if cap is None or not cap.isOpened():
+        # Return a black frame if no camera
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+    
+    ret, frame = cap.read()
+    if ret:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    else:
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+
+# Create the interface
+def create_interface():
     with gr.Blocks(
         title="Nora - AI Grocery Assistant",
         theme=gr.themes.Soft(),
         css="""
-        .main-container { max-width: 800px; margin: 0 auto; padding: 20px; }
-        .status-box { padding: 15px; border-radius: 10px; margin: 10px 0; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .controls { display: flex; gap: 10px; justify-content: center; margin: 20px 0; }
+        .main-container { 
+            height: 100vh; 
+            display: flex; 
+            flex-direction: column; 
+            margin: 0; 
+            padding: 0; 
+        }
+        .header { 
+            text-align: center; 
+            padding: 20px; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin: 0;
+        }
+        .camera-container { 
+            flex: 1; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            background: #000;
+            margin: 0;
+        }
+        .controls { 
+            position: fixed; 
+            bottom: 30px; 
+            left: 50%; 
+            transform: translateX(-50%); 
+            z-index: 1000;
+        }
+        .status-overlay {
+            position: fixed;
+            top: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 20px;
+            z-index: 1000;
+        }
         """
     ) as interface:
         
+        # Header
         gr.HTML("""
         <div class="header">
-            <h1>🛒 Nora - Your AI Grocery Assistant</h1>
-            <p>Talk naturally with Nora about groceries, recipes, and cooking tips!</p>
+            <h1>Nora - Your AI Grocery Assistant</h1>
         </div>
         """)
         
-        with gr.Row():
-            with gr.Column():
-                video_mode = gr.Radio(
-                    choices=["none", "camera", "screen"],
-                    value="none",
-                    label="Video Mode",
-                    info="Choose whether to use camera, screen sharing, or audio only"
-                )
-                
-                with gr.Row():
-                    start_btn = gr.Button("🚀 Start Conversation", variant="primary", size="lg")
-                    stop_btn = gr.Button("🛑 Stop Conversation", variant="secondary", size="lg", interactive=False)
-                
-                status = gr.Textbox(
-                    label="Status",
-                    value="Ready to start conversation",
-                    interactive=False,
-                    lines=2
-                )
+        # Camera feed
+        camera_feed = gr.Image(
+            value=get_camera_feed,
+            streaming=True,
+            every=0.1,
+            height=600,
+            width=800,
+            show_label=False,
+            show_download_button=False,
+            container=False
+        )
         
-        gr.HTML("""
-        <div style="margin-top: 30px; padding: 20px; background-color: #f8f9fa; border-radius: 10px;">
-            <h3>💡 How to use:</h3>
-            <ul>
-                <li><strong>Audio Only:</strong> Select "none" for voice-only conversation</li>
-                <li><strong>Camera:</strong> Select "camera" to show Nora what you're looking at</li>
-                <li><strong>Screen Share:</strong> Select "screen" to share your screen with Nora</li>
-                <li><strong>Natural Conversation:</strong> Nora will pause when you start speaking</li>
-                <li><strong>Topics:</strong> Ask about groceries, recipes, cooking tips, and nutrition</li>
-            </ul>
-        </div>
-        """)
+        # Status display
+        status = gr.Textbox(
+            value="Ready to start conversation",
+            show_label=False,
+            interactive=False,
+            elem_classes="status-overlay"
+        )
+        
+        # Control buttons
+        with gr.Row(elem_classes="controls"):
+            start_btn = gr.Button("🚀 Start Conversation", variant="primary", size="lg", scale=1)
+            stop_btn = gr.Button("🛑 Stop Conversation", variant="secondary", size="lg", scale=1, interactive=False)
         
         # Event handlers
         start_btn.click(
-            fn=start_conversation_sync,
-            inputs=[video_mode],
+            fn=start_conversation,
             outputs=[status, start_btn, stop_btn]
         )
         
         stop_btn.click(
-            fn=stop_conversation_sync,
+            fn=stop_conversation,
             outputs=[status, start_btn, stop_btn]
         )
 
@@ -593,7 +569,7 @@ if __name__ == "__main__":
     print("🚀 Starting Nora - AI Grocery Assistant")
     
     # Create and launch the interface
-    interface = create_gradio_interface()
+    interface = create_interface()
     interface.launch(
         server_name="0.0.0.0",
         server_port=7860,
@@ -601,3 +577,10 @@ if __name__ == "__main__":
         inbrowser=True
     )
 
+    # Cleanup
+    if audio_manager:
+        audio_manager.interrupt()
+        audio_manager.close_streams()
+    
+    if cap:
+        cap.release()
