@@ -116,9 +116,11 @@ class AudioManager:
         self.output_stream = None
         self.input_sample_rate = input_sample_rate
         self.output_sample_rate = output_sample_rate
-        self.audio_queue = deque()
+        self.audio_queue = queue.Queue()  # Thread-safe queue
         self.is_playing = False
-        self.playback_task = None
+        self.playback_thread = None
+        self.stop_playback = threading.Event()
+        self.playback_lock = threading.Lock()
 
     def initialize(self):
         try:
@@ -142,52 +144,102 @@ class AudioManager:
                 channels=CHANNELS,
                 rate=self.output_sample_rate,
                 output=True,
+                frames_per_buffer=CHUNK_SIZE,  # Add buffer size for output
             )
+            
+            # Start the playback thread
+            self.start_playback_thread()
             
             print("Audio streams initialized successfully")
             return True
             
         except Exception as e:
             print(f"Error initializing audio: {e}")
+            traceback.print_exc()
             return False
+
+    def start_playback_thread(self):
+        """Start the dedicated audio playback thread"""
+        if self.playback_thread is None or not self.playback_thread.is_alive():
+            self.stop_playback.clear()
+            self.playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
+            self.playback_thread.start()
+            print("Audio playback thread started")
+
+    def _playback_worker(self):
+        """Worker thread for audio playback"""
+        print("Audio playback worker started")
+        while not self.stop_playback.is_set():
+            try:
+                # Get audio data with timeout
+                audio_data = self.audio_queue.get(timeout=0.1)
+                
+                # Check if user is speaking before playing
+                if not session_state.user_speaking and self.output_stream:
+                    with self.playback_lock:
+                        session_state.ai_speaking = True
+                        try:
+                            self.output_stream.write(audio_data)
+                        except Exception as e:
+                            print(f"Error writing audio data: {e}")
+                        finally:
+                            session_state.ai_speaking = False
+                
+                self.audio_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error in playback worker: {e}")
+                time.sleep(0.1)
+        
+        print("Audio playback worker stopped")
 
     def add_audio(self, audio_data):
         """Add audio data to the playback queue"""
-        if not session_state.user_speaking:
-            self.audio_queue.append(audio_data)
-
-    def play_audio_sync(self):
-        """Play audio synchronously"""
-        if not self.audio_queue:
-            return
-            
-        session_state.ai_speaking = True
-        print("Nora speaking...")
-        
-        while self.audio_queue and not session_state.user_speaking:
-            try:
-                audio_data = self.audio_queue.popleft()
-                if self.output_stream:
-                    self.output_stream.write(audio_data)
-            except Exception as e:
-                print(f"Error playing audio: {e}")
-                break
-                
-        session_state.ai_speaking = False
-        print("Nora finished speaking")
+        try:
+            if not session_state.user_speaking and not self.stop_playback.is_set():
+                # Add to queue with size limit to prevent memory issues
+                if self.audio_queue.qsize() < 50:  # Limit queue size
+                    self.audio_queue.put(audio_data, block=False)
+                else:
+                    print("Audio queue full, dropping audio data")
+        except queue.Full:
+            print("Audio queue full, dropping audio data")
+        except Exception as e:
+            print(f"Error adding audio to queue: {e}")
 
     def interrupt(self):
         """Handle interruption by stopping playback and clearing queue"""
-        self.audio_queue.clear()
-        session_state.ai_speaking = False
-        print("AI speech interrupted")
+        try:
+            with self.playback_lock:
+                # Clear the queue
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                        self.audio_queue.task_done()
+                    except queue.Empty:
+                        break
+                
+                session_state.ai_speaking = False
+                print("AI speech interrupted and queue cleared")
+        except Exception as e:
+            print(f"Error during interrupt: {e}")
 
     def close_streams(self):
         """Close audio streams and terminate PyAudio."""
         try:
+            # Stop playback thread
+            self.stop_playback.set()
+            if self.playback_thread and self.playback_thread.is_alive():
+                self.playback_thread.join(timeout=2.0)
+            
+            # Close streams
             if self.input_stream is not None:
+                self.input_stream.stop_stream()
                 self.input_stream.close()
             if self.output_stream is not None:
+                self.output_stream.stop_stream()
                 self.output_stream.close()
             if self.pya is not None:
                 self.pya.terminate()
@@ -208,7 +260,7 @@ def detect_audio_level(audio_data):
         rms = np.sqrt(np.mean(audio_float**2))
         
         # Threshold for speech detection (adjust as needed)
-        return rms > 300
+        return rms > 500  # Increased threshold to reduce false positives
     except Exception as e:
         print(f"Error in audio level detection: {e}")
         return False
@@ -304,9 +356,6 @@ async def async_conversation_loop(audio_manager):
             session_state.session = session
             print("Nora session started successfully")
             
-            # Create tasks
-            tasks = []
-            
             # Audio input task
             async def audio_input_task():
                 print("Audio input started")
@@ -335,12 +384,13 @@ async def async_conversation_loop(audio_manager):
                                     session_state.user_speaking = False
                                     print("User stopped speaking")
                         
-                        await audio_send_queue.put(data)
+                        if not audio_send_queue.full():
+                            await audio_send_queue.put(data)
                         
                     except Exception as e:
                         if "Input overflowed" not in str(e):
                             print(f"Audio input error: {e}")
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.01)
                         
                 print("Audio input stopped")
 
@@ -394,12 +444,8 @@ async def async_conversation_loop(audio_manager):
                         if server_content and server_content.model_turn:
                             for part in server_content.model_turn.parts:
                                 if part.inline_data and not session_state.user_speaking:
+                                    # Add audio to queue for playback
                                     audio_manager.add_audio(part.inline_data.data)
-                                    # Play audio in separate thread to avoid blocking
-                                    threading.Thread(
-                                        target=audio_manager.play_audio_sync, 
-                                        daemon=True
-                                    ).start()
                                     
                                 if part.text:
                                     print(f"Nora: {part.text}")
@@ -409,22 +455,27 @@ async def async_conversation_loop(audio_manager):
                             
                 except Exception as e:
                     print(f"Response receiver error: {e}")
+                    traceback.print_exc()
                     
                 print("Response receiver stopped")
 
             # Video frame task
             async def video_frame_task():
                 print("Video frame task started")
+                frame_count = 0
                 while session_state.is_active:
                     try:
                         # Get frame from webcam if available
                         if session_state.webcam is not None:
                             ret, frame = session_state.webcam.read()
                             if ret:
-                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                frame_data = get_frame_data(frame_rgb)
-                                if frame_data:
-                                    await video_send_queue.put(frame_data)
+                                frame_count += 1
+                                # Send frame less frequently to reduce load
+                                if frame_count % 30 == 0:  # Every 30th frame
+                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    frame_data = get_frame_data(frame_rgb)
+                                    if frame_data and not video_send_queue.full():
+                                        await video_send_queue.put(frame_data)
                                     
                         await asyncio.sleep(VIDEO_FRAME_RATE_DELAY)
                         
@@ -453,6 +504,11 @@ async def async_conversation_loop(audio_manager):
             for task in tasks:
                 task.cancel()
                 
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception as e:
+                print(f"Error cancelling tasks: {e}")
+            
             print("Session ended, tasks cancelled")
             
     except Exception as e:
@@ -478,6 +534,11 @@ def toggle_session():
             if not session_state.webcam.isOpened():
                 print("Warning: Could not open webcam")
                 session_state.webcam = None
+            else:
+                # Set webcam properties for better performance
+                session_state.webcam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                session_state.webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                session_state.webcam.set(cv2.CAP_PROP_FPS, 15)
         except Exception as e:
             print(f"Webcam error: {e}")
             session_state.webcam = None
@@ -503,6 +564,10 @@ def toggle_session():
         if session_state.webcam:
             session_state.webcam.release()
             session_state.webcam = None
+            
+        # Wait for thread to finish
+        if session_state.conversation_thread and session_state.conversation_thread.is_alive():
+            session_state.conversation_thread.join(timeout=3.0)
             
         return gr.update(value="Start Session", variant="primary"), "Session stopped"
 
